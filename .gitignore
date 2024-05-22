@@ -151,3 +151,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 /Atlantis2
+_tmp.dbf
+_tmp.nc
+_tmp.prj
+_tmp.shp
+_tmp.shp.gplates.xml
+_tmp.shx
