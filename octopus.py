@@ -7,6 +7,9 @@ import xarray as xr
 import pyshtools
 from xrspatial import proximity
 
+from scipy.ndimage import convolve
+
+
 from ptt.utils.call_system_command import call_system_command
 import gprm.utils.paleogeography as pg
 from gprm.utils import inpaint
@@ -17,6 +20,19 @@ import map_effects as me
 
 sys.path.append('../sphipple/')
 from stipple_scalar_grids_spherical import quantize_grid, mach_banding, write_netcdf_grid
+
+sys.path.append('/Users/simon/GIT/pgpslabs/')
+import slab_tracker_utils as slab
+
+sys.path.append('/Users/simon/GIT/vh0/notebooks/ModelGeneration/')
+import ocean_remanence_vectors as orv
+from remit.data.models import create_vim
+from remit.utils.grid import coeffs2map
+#from remit.utils.profile import polarity_timescale
+from remit.earthvim import SeafloorGrid, GlobalVIS, PolarityTimescale
+from remit.utils.grid import shmaggrid2tmi
+
+
 
 
 def generate_seafloor_bathymetry(filename, final_grd_sampling):
@@ -245,3 +261,216 @@ def generate_seafloor_fabric(seafloor_age, final_grd_sampling,
     
     
     
+def generate_slab_earthquakes(reconstruction_model, 
+                              n_samples=200,
+                              start_time = 40.,
+                              end_time = 0.,
+                              time_step = 2.0,
+                              dip_angle_degrees = 45.0,
+                              line_tessellation_distance = np.radians(1.0)):
+    
+    agegrid_filename = None
+    topology_features = reconstruction_model.dynamic_polygons
+    rotation_model = reconstruction_model.rotation_model
+
+    subduction_boundary_sections = slab.getSubductionBoundarySections(
+        topology_features,
+        rotation_model,
+        0.)
+    
+    output_data = []
+    dip_angle_radians = np.radians(dip_angle_degrees)
+    time_list = np.arange(start_time,end_time-time_step,-time_step)
+
+    for time in time_list:
+
+        print('time %0.2f Ma' % time)
+
+        # call function to get subduction boundary segments
+        subduction_boundary_sections = slab.getSubductionBoundarySections(topology_features,
+                                                                          rotation_model,
+                                                                          time)
+
+        # Set up an age grid interpolator for this time, to be used
+        # for each tessellated line segment
+        ##grdfile = '../agegrid-0.1/grid_files/unmasked/M16_seafloor_age_0.0Ma.nc'
+        ##lut = slab.make_age_interpolator(grdfile)
+
+        # Loop over each segment
+        for segment_index,subduction_segment in enumerate(subduction_boundary_sections):
+
+            # find the overrding plate id (and only continue if we find it)
+            overriding_and_subducting_plates = slab.find_overriding_and_subducting_plates(subduction_segment,time)
+
+            if not overriding_and_subducting_plates:
+                continue
+            overriding_plate, subducting_plate, subduction_polarity = overriding_and_subducting_plates
+
+            overriding_plate_id = overriding_plate.get_resolved_feature().get_reconstruction_plate_id()
+            subducting_plate_id = subducting_plate.get_resolved_feature().get_reconstruction_plate_id()
+
+            subducting_plate_disappearance_time = -1.
+
+            tessellated_line = subduction_segment.get_resolved_geometry().to_tessellated(line_tessellation_distance)
+
+            #print len(tessellated_line.get_points())
+
+            if agegrid_filename is not None:
+                x = tessellated_line.to_lat_lon_array()[:,1]
+                y = tessellated_line.to_lat_lon_array()[:,0]
+                subduction_ages = lut.ev(np.radians(y+90.),np.radians(x+180.))
+            else:
+                # if no age grids, just fill the ages with zero
+                subduction_ages = [0. for point in tessellated_line.to_lat_lon_array()[:,1]]
+
+            # CALL THE MAIN WARPING FUNCTION
+            (points, 
+             point_depths, 
+             polyline) = slab.warp_subduction_segment(tessellated_line,
+                                                      rotation_model,
+                                                      subducting_plate_id,
+                                                      overriding_plate_id,
+                                                      subduction_polarity,
+                                                      time,
+                                                      end_time,
+                                                      time_step,
+                                                      dip_angle_radians,
+                                                      subducting_plate_disappearance_time)
+
+            output_data.append(gpd.GeoDataFrame(
+                data={'subduction_time':np.ones(len(point_depths)).T*time,
+                      'depth': point_depths,
+                      'age_at_subduction': subduction_ages},
+                geometry=gpd.points_from_xy(polyline.to_lat_lon_array()[:,1], 
+                                            polyline.to_lat_lon_array()[:,0]), 
+                crs=4326))
+
+    present_day_slab = gpd.GeoDataFrame(
+        gpd.pd.concat(output_data, ignore_index=True), crs=output_data[0].crs)
+    slab_earthquakes = present_day_slab.sample(n_samples)
+    
+    return gpd.GeoDataFrame(slab_earthquakes)
+
+
+
+def generate_magnetic_map(reconstruction_model, age_grid_filename,
+                          final_grd_sampling,
+                          lmin=16, lmax=500, grid_dims=(1801,3601)):
+    
+    snapshot = reconstruction_model.plate_snapshot(0.)
+
+    static_polygon_filename = './_tmp.shp'
+    fc = pygplates.FeatureCollection([rt.get_resolved_feature() for rt in snapshot.resolved_topologies])
+    fc.write(static_polygon_filename)
+
+    age_grid, plate_id_raster = orv.build_input_grids(age_grid_filename,
+                                                      static_polygon_filename,
+                                                      final_grd_sampling)
+
+    print('Generating magnetization vectors...')
+    (paleo_latitude,
+     paleo_declination) = orv.reconstruct_agegrid_to_birthtime(
+        reconstruction_model, 
+        age_grid, 
+        plate_id_raster, 
+        return_type='xarray')
+
+
+    GPTS = PolarityTimescale(timescalefile='/Users/simon/Documents/2022IMAS-OUC_SOMG/PracFiles/Atlantis2/Atlantis_GPTS.txt')
+
+    GK07 = {'seafloor_layer':'2d',
+            'layer_boundary_depths':[0,500,1500,6500], 
+            'layer_weights':[5,2.3,1.2], 
+            'MagMax':None, 
+            'P':5, 
+            'lmbda':3, 
+            'Mtrm':1, 
+            'Mcrm':0,
+            'PolarityTimescale':GPTS}
+
+
+    ocean = SeafloorGrid.from_xarray(age_grid, paleo_declination, paleo_latitude)
+    ocean.resample(shape=grid_dims)
+
+    layer_params = GK07.copy()
+
+    vis = GlobalVIS.from_random(exponent=-1.5, scaling=0.02)
+    vis.resample(shape=grid_dims)
+
+    print('Computing VIM...')
+    totalvim = create_vim(ocean, vis, **layer_params)
+    
+    print('Computing vsh transform...')
+    vsh, coeffs = totalvim.transform(lmax=lmax)
+
+    print('Computing TMI map...')
+    # Need to make this into xarray
+    tmi = shmaggrid2tmi(coeffs.expand(a=6371000+50000.))
+
+    return tmi
+    
+    
+    
+def create_gaussian_kernel(size, sigma):
+    """Create a 2D Gaussian kernel."""
+    k = (size - 1) // 2
+    x, y = np.mgrid[-k:k+1, -k:k+1]
+    g = np.exp(-(x**2 + y**2) / (2 * sigma**2))
+    return g / g.sum()
+
+
+def apply_spatially_varying_smoothing(smoothing_array, data_array, vary_kernel_size=False):
+    """Apply spatially varying smoothing to the data_array based on smoothing_array."""
+    smoothed_array = np.zeros_like(data_array)
+    rows, cols = data_array.shape
+    
+    for i in range(rows):
+        for j in range(cols):
+            # Determine the kernel size and sigma based on the smoothing factor
+            smoothing_factor = smoothing_array[i, j]
+            if vary_kernel_size:
+                kernel_size = max(3, int(smoothing_factor) * 2 + 1)  # Ensure kernel size is at least 3
+            kernel_size = 7
+            sigma = smoothing_factor
+            
+            # Create the Gaussian kernel
+            kernel = create_gaussian_kernel(kernel_size, sigma)
+            
+            # Determine the region to apply the kernel
+            half_k = kernel_size // 2
+            i_min = max(i - half_k, 0)
+            i_max = min(i + half_k + 1, rows)
+            j_min = max(j - half_k, 0)
+            j_max = min(j + half_k + 1, cols)
+            
+            # Extract the region and apply the convolution
+            region = data_array[i_min:i_max, j_min:j_max]
+            k_i_min = max(half_k - i, 0)
+            k_i_max = min(half_k + (rows - i), kernel_size)
+            k_j_min = max(half_k - j, 0)
+            k_j_max = min(half_k + (cols - j), kernel_size)
+            region_kernel = kernel[k_i_min:k_i_max, k_j_min:k_j_max]
+            
+            # Apply convolution to the region and assign the result to the center cell
+            if region.size > 0:
+                smoothed_value = np.sum(region * region_kernel)
+                smoothed_array[i, j] = smoothed_value
+    
+    return smoothed_array    
+    
+    
+def smooth_seafloor(seafloor_age, seafloor_depth, scaling=0.1, smoothing_age_min=50, smoothing_age_max=200):    
+    
+    smoothing_array = inpaint.fill_ndimage(seafloor_age.data)
+    data_array = inpaint.fill_ndimage(seafloor_depth.data)
+
+    smoothing_array[smoothing_array<smoothing_age_min] = smoothing_age_min
+    smoothing_array[smoothing_array>smoothing_age_max] = smoothing_age_max
+
+    smoothing_array = smoothing_array - smoothing_age_min + 0.1
+    smoothing_array = smoothing_array * scaling
+    
+    smoothed_array = apply_spatially_varying_smoothing(smoothing_array, data_array)
+    
+    return smoothed_array
+
