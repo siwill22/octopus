@@ -159,3 +159,6 @@ _tmp.shp.gplates.xml
 _tmp.shx
 qraster.nc
 .DS_Store
+Atlantis2_Database/PlateBoundary_Earthquakes.geojson
+Atlantis2_Database/PlateBoundary_Earthquakes.geojson.gplates.xml
+Atlantis2_Database/total_magnetic_intensity.nc
