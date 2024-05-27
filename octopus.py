@@ -6,6 +6,7 @@ import os, sys
 import xarray as xr
 import pyshtools
 from xrspatial import proximity
+from scipy.interpolate import interpn
 
 from scipy.ndimage import convolve
 
@@ -14,6 +15,7 @@ from ptt.utils.call_system_command import call_system_command
 import gprm.utils.paleogeography as pg
 from gprm.utils import inpaint
 from gprm.utils.deformation import topological_reconstruction
+from gprm import PointDistributionOnSphere
 
 sys.path.append('/Users/simon/GIT/degenerative_art/')
 import map_effects as me
@@ -134,7 +136,7 @@ def merge_topography_and_bathymetry(seafloor_depth, topography, prox_sz=None,
 
     #from rasterio.fill import fillnodata
     #merge.data = fillnodata(merge.data, mask=np.isnan(merge.data), smoothing_iterations=10) 
-    merge.data = inpaint.fill_ndimage(merge.data)
+    merge.data = inpaint.fill_inpaint(merge.data, kernel_size=7)# method='idw')
 
     if prox_sz is not None:
         subduction_trench = 1-(prox_sz-trench_dist_max)
@@ -151,6 +153,7 @@ def add_seamount_trails(reconstruction_model,
                         elevation_map,
                         hot_spot_points, 
                         final_grd_sampling,
+                        filter_length_km = 500,
                         anchor_plate_id = 0, 
                         initial_time = 100, 
                         youngest_time = 0, 
@@ -193,8 +196,6 @@ def add_seamount_trails(reconstruction_model,
         d2sm = d2sm.where(d2sm>100.,100.)
         d2sm = (1./d2sm)
 
-
-        filter_length_km = 1000
         #pygmt.grdfilter(tmp, filter='g{:f}k+h'.format(filter_length_km), 
         #                distance='2', coltypes='g').plot()
         d2sm.to_netcdf('./_tmp.nc')
@@ -212,12 +213,13 @@ def add_seamount_trails(reconstruction_model,
 
 
 
-def make_noise_grid(lmax=300, exponent=-2, scaling=1, spacing='6m'):
+def make_noise_grid(lmin=0, lmax=300, exponent=-2, scaling=1, spacing='6m'):
+    
     degrees = np.arange(lmax+1, dtype=float)
     degrees[0] = np.inf
 
     power_per_degree = degrees**(exponent)
-    power_per_degree[:200] = 0
+    power_per_degree[:lmin] = 0
 
     noise = pyshtools.SHCoeffs.from_random(power_per_degree, seed=None).expand().to_xarray()
 
@@ -225,28 +227,46 @@ def make_noise_grid(lmax=300, exponent=-2, scaling=1, spacing='6m'):
     return noise*scaling
 
 
+def scale_array_to_range(array, new_min=-1000, new_max=1000):
+    """
+    Scales a 2D numpy array to a specified range [-1000, 1000].
+
+    Parameters:
+        array (numpy.ndarray): Input 2D array.
+        new_min (float): The minimum value of the new range (default -1000).
+        new_max (float): The maximum value of the new range (default +1000).
+
+    Returns:
+        numpy.ndarray: Scaled array with values in the specified range.
+    """
+    old_min = np.min(array)
+    old_max = np.max(array)
+    
+    # Avoid division by zero if all values in the array are the same
+    if old_min == old_max:
+        return np.full_like(array, (new_max + new_min) / 2)
+    
+    # Calculate the scaling factor and offset
+    scale_factor = (new_max - new_min) / (old_max - old_min)
+    offset = new_min - (old_min * scale_factor)
+    
+    # Apply the scaling factor and offset
+    scaled_array = (array * scale_factor) + offset
+        
+    return scaled_array
+
+
 def generate_seafloor_fabric(seafloor_age, final_grd_sampling, 
+                             target_range=None,
                              q=5, noise_scaling=5,
                              hp_filter_length_km = 500., 
                              lp_filter_length_km = 250.):
-    
-
-    #agegrid = xr.open_dataarray('/Users/simon/Data/AgeGrids/2020/age.2020.1.GeeK2007.6m.nc')
-    #agegrid = pygmt.grdsample('../octopus/Atlantis2/masked/Atlantis2_seafloor_age_mask_0.0Ma.nc',
-    #                          region='d', spacing='{:f}d'.format(final_grd_sampling))
-    #agegrid.data += make_noise_grid(lmax=400, scaling=2.).data
-
 
     quantized_raster = quantize_grid(seafloor_age, q=q)
 
-    quantized_raster.data += make_noise_grid(lmax=400, scaling=noise_scaling, spacing='{:f}d'.format(final_grd_sampling)).data
-
-    quantized_raster
+    quantized_raster.data += make_noise_grid(lmin=200, lmax=400, scaling=noise_scaling, spacing='{:f}d'.format(final_grd_sampling)).data
 
     write_netcdf_grid('qraster.nc', seafloor_age.lon.data, seafloor_age.lat.data, quantized_raster)
-    #filt_grid = pygmt.grdfilter(quantized_raster, 
-    #                            filter='g{:f}k+h'.format(filter_length_km), 
-    #                            distance='2', coltypes='g')
 
     call_system_command(['gmt', 'grdfilter', 'qraster.nc', 
                          '-Fg{:f}k+h'.format(hp_filter_length_km), '-D2', '-Gmach_banded_raster.nc', '-fg'])
@@ -257,8 +277,89 @@ def generate_seafloor_fabric(seafloor_age, final_grd_sampling,
 
     filt_grid = filt_grid.where(np.isfinite(filt_grid), 0)
     
+    if target_range is not None:
+        filt_grid.data = scale_array_to_range(filt_grid.data, new_min=-target_range/2, new_max=target_range/2)
+        
+    filt_grid = filt_grid - filt_grid.data.mean()
+        
     return filt_grid
+
+
+# Functions for spatially-varying smoothing
+def create_gaussian_kernel(size, sigma):
+    """Create a 2D Gaussian kernel."""
+    k = (size - 1) // 2
+    x, y = np.mgrid[-k:k+1, -k:k+1]
+    g = np.exp(-(x**2 + y**2) / (2 * sigma**2))
+    return g / g.sum()
+
+
+def apply_spatially_varying_smoothing(smoothing_array, data_array, vary_kernel_size=False):
+    """Apply spatially varying smoothing to the data_array based on smoothing_array."""
+    smoothed_array = np.zeros_like(data_array)
+    rows, cols = data_array.shape
     
+    for i in range(rows):
+        for j in range(cols):
+            # Determine the kernel size and sigma based on the smoothing factor
+            smoothing_factor = smoothing_array[i, j]
+            if vary_kernel_size:
+                kernel_size = max(3, int(smoothing_factor) * 2 + 1)  # Ensure kernel size is at least 3
+            else:
+                kernel_size = 7
+            sigma = smoothing_factor
+            
+            # Create the Gaussian kernel
+            kernel = create_gaussian_kernel(kernel_size, sigma)
+            
+            # Determine the region to apply the kernel
+            half_k = kernel_size // 2
+            i_min = max(i - half_k, 0)
+            i_max = min(i + half_k + 1, rows)
+            j_min = max(j - half_k, 0)
+            j_max = min(j + half_k + 1, cols)
+            
+            # Extract the region and apply the convolution
+            region = data_array[i_min:i_max, j_min:j_max]
+            k_i_min = max(half_k - i, 0)
+            k_i_max = min(half_k + (rows - i), kernel_size)
+            k_j_min = max(half_k - j, 0)
+            k_j_max = min(half_k + (cols - j), kernel_size)
+            region_kernel = kernel[k_i_min:k_i_max, k_j_min:k_j_max]
+            
+            # Apply convolution to the region and assign the result to the center cell
+            if region.size > 0:
+                smoothed_value = np.sum(region * region_kernel)
+                smoothed_array[i, j] = smoothed_value
+    
+    return smoothed_array    
+    
+    
+def smooth_seafloor(seafloor_age, seafloor_depth, scaling=0.1, target_range=None,
+                    smoothing_age_min=30, smoothing_age_max=200, vary_kernel_size=False):    
+    
+    smoothed_array = seafloor_depth.copy(deep=True)
+    
+    smoothing_array = inpaint.fill_ndimage(seafloor_age.data)
+    data_array = inpaint.fill_ndimage(seafloor_depth.data)
+
+    smoothing_array[smoothing_array<smoothing_age_min] = smoothing_age_min
+    smoothing_array[smoothing_array>smoothing_age_max] = smoothing_age_max
+
+    smoothing_array = smoothing_array - smoothing_age_min + 0.0001
+    smoothing_array = smoothing_array * scaling
+    
+    if vary_kernel_size:
+        print('max kernel size = {:d}'.format(max(3, int(smoothing_array.max()) * 2 + 1)))
+    smoothed_array.data = apply_spatially_varying_smoothing(smoothing_array, data_array, vary_kernel_size=vary_kernel_size)
+    
+    if target_range is not None:
+        smoothed_array.data = scale_array_to_range(smoothed_array.data, new_min=-target_range/2, new_max=target_range/2)
+    smoothed_array = smoothed_array - smoothed_array.data.mean()
+
+    return smoothed_array
+
+
     
     
 def generate_slab_earthquakes(reconstruction_model, 
@@ -352,7 +453,62 @@ def generate_slab_earthquakes(reconstruction_model,
     return gpd.GeoDataFrame(slab_earthquakes)
 
 
+def generate_plate_boundary_earthquakes(reconstruction_model, n_points, 
+                                    max_distance=2e4, min_depth=1, max_depth=60):
+    
+    snapshot = reconstruction_model.plate_snapshot(0.)
+    plate_boundaries = snapshot.get_boundary_features()
 
+    all_pb_points = []
+    for pb in plate_boundaries:
+        if pb.get_geometry():
+            all_pb_points.extend(pb.get_geometry().to_tessellated(np.radians(0.1)).to_lat_lon_list())
+
+    prox_pb = me.points_proximity(x=[lon for lat,lon in all_pb_points],
+                                  y=[lat for lat,lon in all_pb_points],
+                                  spacing=0.1)
+    
+    pts = PointDistributionOnSphere(N=int(n_points))
+
+    plate_boundary_earthquakes = gpd.GeoDataFrame(geometry=gpd.points_from_xy(pts.longitude, pts.latitude), crs=4326)
+    plate_boundary_earthquakes['distance_to_boundary'] = interpolate_values(prox_pb, plate_boundary_earthquakes)
+
+    plate_boundary_earthquakes = plate_boundary_earthquakes.query('distance_to_boundary<@max_distance').reset_index()
+
+    plate_boundary_earthquakes['depth'] = np.random.uniform(min_depth, max_depth, len(plate_boundary_earthquakes))
+    
+    return plate_boundary_earthquakes
+
+
+def interpolate_values(dataarray, coordinates):
+    """
+    Interpolate values from a 2D xarray DataArray at arbitrary coordinates using linear interpolation.
+
+    Parameters:
+    dataarray (xarray.DataArray): 2D DataArray with coordinates as longitude and latitude.
+    points (list of tuples): List of (longitude, latitude) coordinates where interpolation is desired.
+
+    Returns:
+    np.ndarray: Interpolated values at the specified points.
+    """
+    # Extract the coordinates and data values from the DataArray
+    lon = dataarray['x'].values
+    lat = dataarray['y'].values
+    values = dataarray.values
+
+    # Create the grid of points from the coordinates
+    grid = (lat, lon)
+
+    points = [(row.geometry.y, row.geometry.x) for i,row in coordinates.iterrows()]
+    
+    # Perform the interpolation
+    interpolated_values = interpn(grid, values, points, method='nearest', bounds_error=False, fill_value=None)
+
+    return interpolated_values
+
+
+
+####################################################################
 def generate_magnetic_map(reconstruction_model, age_grid_filename,
                           final_grd_sampling,
                           lmin=16, lmax=500, grid_dims=(1801,3601)):
@@ -409,68 +565,101 @@ def generate_magnetic_map(reconstruction_model, age_grid_filename,
 
     return tmi
     
+
     
+####################################################################
+from scipy.stats import truncnorm
+
+def generate_random_coordinates_by_latitude(n_points, central_lat=20, lat_std=5, lon_range=(-200, 200)):
+    """
+    Generate random coordinates on the surface of a sphere with latitude following a Gaussian distribution.
     
-def create_gaussian_kernel(size, sigma):
-    """Create a 2D Gaussian kernel."""
-    k = (size - 1) // 2
-    x, y = np.mgrid[-k:k+1, -k:k+1]
-    g = np.exp(-(x**2 + y**2) / (2 * sigma**2))
-    return g / g.sum()
+    Parameters:
+    n_points (int): Number of random points to generate.
+    central_lat (float): Central latitude for Gaussian distribution (in degrees).
+    lat_std (float): Standard deviation for the Gaussian distribution (in degrees).
+    lon_range (tuple): Range of longitude values (in degrees), typically (0, 360).
+    
+    Returns:
+    list of tuples: List containing the generated (latitude, longitude) pairs.
+    """
+    # Define the truncated normal distribution for latitude
+    lat_min, lat_max = central_lat - (lat_std*3), central_lat + (lat_std*3)  # 15 degrees above and below the central latitude
+    a, b = (lat_min - central_lat) / lat_std, (lat_max - central_lat) / lat_std
+    lat_distribution = truncnorm(a, b, loc=central_lat, scale=lat_std)
+    
+    # Generate latitudes
+    latitudes = lat_distribution.rvs(n_points)
+    
+    # Randomly assign half of the points to the southern hemisphere
+    southern_hemisphere = np.random.choice([True, False], size=n_points)
+    latitudes[southern_hemisphere] *= -1
+    
+    # Generate longitudes uniformly
+    longitudes = np.random.uniform(lon_range[0], lon_range[1], n_points)
+    
+    # Combine latitudes and longitudes
+    #coordinates = list(zip(longitudes, latitudes))
+    
+    df = gpd.pd.DataFrame(data={'Longitude': longitudes,
+                                'Latitude': latitudes})
+    return gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.Longitude, df.Latitude), crs=4326)
+    
+
+def generate_climate_sensitive_deposits(land_raster, central_lat, lat_std, n_points=100):
+
+    coordinates = generate_random_coordinates_by_latitude(n_points, central_lat=central_lat, lat_std=lat_std)
+
+    # Interpolate values at the specified points
+    coordinates['interpolated_values'] = interpolate_values(land_raster, coordinates)
+    #coordinates = coordinates.query('interpolated_values>0')
+    
+    return coordinates
 
 
-def apply_spatially_varying_smoothing(smoothing_array, data_array, vary_kernel_size=False):
-    """Apply spatially varying smoothing to the data_array based on smoothing_array."""
-    smoothed_array = np.zeros_like(data_array)
-    rows, cols = data_array.shape
-    
-    for i in range(rows):
-        for j in range(cols):
-            # Determine the kernel size and sigma based on the smoothing factor
-            smoothing_factor = smoothing_array[i, j]
-            if vary_kernel_size:
-                kernel_size = max(3, int(smoothing_factor) * 2 + 1)  # Ensure kernel size is at least 3
-            kernel_size = 7
-            sigma = smoothing_factor
-            
-            # Create the Gaussian kernel
-            kernel = create_gaussian_kernel(kernel_size, sigma)
-            
-            # Determine the region to apply the kernel
-            half_k = kernel_size // 2
-            i_min = max(i - half_k, 0)
-            i_max = min(i + half_k + 1, rows)
-            j_min = max(j - half_k, 0)
-            j_max = min(j + half_k + 1, cols)
-            
-            # Extract the region and apply the convolution
-            region = data_array[i_min:i_max, j_min:j_max]
-            k_i_min = max(half_k - i, 0)
-            k_i_max = min(half_k + (rows - i), kernel_size)
-            k_j_min = max(half_k - j, 0)
-            k_j_max = min(half_k + (cols - j), kernel_size)
-            region_kernel = kernel[k_i_min:k_i_max, k_j_min:k_j_max]
-            
-            # Apply convolution to the region and assign the result to the center cell
-            if region.size > 0:
-                smoothed_value = np.sum(region * region_kernel)
-                smoothed_array[i, j] = smoothed_value
-    
-    return smoothed_array    
-    
-    
-def smooth_seafloor(seafloor_age, seafloor_depth, scaling=0.1, smoothing_age_min=50, smoothing_age_max=200):    
-    
-    smoothing_array = inpaint.fill_ndimage(seafloor_age.data)
-    data_array = inpaint.fill_ndimage(seafloor_depth.data)
+def generate_weighted_random_points(dataarray, n_points):
+    """
+    Generate random points weighted by the values in a 2D xarray DataArray.
 
-    smoothing_array[smoothing_array<smoothing_age_min] = smoothing_age_min
-    smoothing_array[smoothing_array>smoothing_age_max] = smoothing_age_max
+    Parameters:
+    dataarray (xarray.DataArray): 2D DataArray with likelihood values at each grid node.
+    n_points (int): Number of random points to generate.
 
-    smoothing_array = smoothing_array - smoothing_age_min + 0.1
-    smoothing_array = smoothing_array * scaling
+    Returns:
+    list of tuples: List containing the generated (x, y) coordinates.
+    """
+    # Normalize the DataArray values to probabilities
+    values = dataarray.values
+    probabilities = values / values.sum()
+
+    # Flatten the probabilities and generate the CDF
+    flattened_probabilities = probabilities.ravel()
+    cdf = np.cumsum(flattened_probabilities)
+
+    # Generate uniform random samples
+    random_samples = np.random.rand(n_points)
+
+    # Map the uniform random samples to the CDF
+    random_indices = np.searchsorted(cdf, random_samples)
+
+    # Convert the flat indices back to 2D indices
+    y_indices, x_indices = np.unravel_index(random_indices, dataarray.shape)
+
+    # Generate the corresponding x, y coordinates
+    x_coords = dataarray['x'].values[x_indices]
+    y_coords = dataarray['y'].values[y_indices]
+
+    # Combine x and y coordinates into tuples
+    #coordinates = list(zip(x_coords, y_coords))
     
-    smoothed_array = apply_spatially_varying_smoothing(smoothing_array, data_array)
-    
-    return smoothed_array
+    df = gpd.pd.DataFrame(data={'Longitude': x_coords,
+                                'Latitude': y_coords})
+    return gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.Longitude, df.Latitude), crs=4326)
+
+
+
+def unreconstruct_geodataframe(gdf, reconstruction_model, reconstructed_polygons, reconstruction_time):
+
+    gdf = gdf.overlay(reconstructed_polygons, how='intersection', keep_geom_type=False)
+    return reconstruction_model.reconstruct(gdf, reconstruction_time=reconstruction_time, reverse=True)
 
