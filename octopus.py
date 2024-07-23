@@ -155,7 +155,7 @@ def add_seamount_trails(reconstruction_model,
                         final_grd_sampling,
                         filter_length_km = 500,
                         anchor_plate_id = 0, 
-                        initial_time = 100, 
+                        initial_time = 200, 
                         youngest_time = 0, 
                         time_increment = 1):
     
@@ -169,13 +169,13 @@ def add_seamount_trails(reconstruction_model,
     for hot_spot_key in hot_spot_points:
         rp = []
         ra = []
-        reconstruction_times = np.sort(np.random.uniform(0, 200, size=25))
+        reconstruction_times = np.sort(np.random.uniform(0, initial_time, size=25))
         for reconstruction_time in reconstruction_times:
 
             reconstructed_points = topological_model.reconstruct_geometry(
                 pygplates.PointOnSphere(hot_spot_points[hot_spot_key]),
                 initial_time=reconstruction_time,
-                oldest_time=200.,
+                oldest_time=initial_time,
                 youngest_time=0.,
                 time_increment=1)
 
@@ -205,7 +205,7 @@ def add_seamount_trails(reconstruction_model,
         os.remove('./_tmpp.nc')
         #"""
 
-        seamounts = (seamounts/seamounts.data.max())*np.random.uniform(low=2000,high=3000,size=1)
+        seamounts = (seamounts/seamounts.data.max())*np.random.uniform(low=2000,high=4000,size=1)
         seamounts = seamounts.where(elevation_map<0, 0)
         elevation_map+=seamounts
         
@@ -480,6 +480,27 @@ def generate_plate_boundary_earthquakes(reconstruction_model, n_points,
     return plate_boundary_earthquakes
 
 
+
+def generate_hotspot_earthquakes(hot_spot_points, n_points, 
+                                 max_distance=2e4, min_depth=1, max_depth=60):
+
+    coords = [hot_spot_points[x] for x in hot_spot_points.keys()]
+    prox_pb = me.points_proximity(x=[lon for lat,lon in coords],
+                                  y=[lat for lat,lon in coords],
+                                  spacing=0.1)
+
+    pts = PointDistributionOnSphere(N=int(n_points))
+
+    hotspot_earthquakes = gpd.GeoDataFrame(geometry=gpd.points_from_xy(pts.longitude, pts.latitude), crs=4326)
+    hotspot_earthquakes['distance_to_hotspot'] = interpolate_values(prox_pb, hotspot_earthquakes)
+
+    hotspot_earthquakes = hotspot_earthquakes.query('distance_to_hotspot<@max_distance').reset_index()
+
+    hotspot_earthquakes['depth'] = np.random.uniform(min_depth, max_depth, len(hotspot_earthquakes))
+    
+    return hotspot_earthquakes
+
+
 def interpolate_values(dataarray, coordinates):
     """
     Interpolate values from a 2D xarray DataArray at arbitrary coordinates using linear interpolation.
@@ -532,7 +553,7 @@ def generate_magnetic_map(reconstruction_model, age_grid_filename,
         return_type='xarray')
 
 
-    GPTS = PolarityTimescale(timescalefile='/Users/simon/Documents/2022IMAS-OUC_SOMG/PracFiles/Atlantis2/Atlantis_GPTS.txt')
+    GPTS = PolarityTimescale(timescalefile='/Users/simon/OneDrive - University of Tasmania/Documents/2022IMAS-OUC_SOMG/PracFiles/Atlantis2/Atlantis_GPTS.txt')
 
     GK07 = {'seafloor_layer':'2d',
             'layer_boundary_depths':[0,500,1500,6500], 
