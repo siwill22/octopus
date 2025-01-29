@@ -168,3 +168,5 @@ landscape/mesh.msh
 landscape/mesh.jig
 landscape/mesh-HFUN.msh
 landscape/cellWidthVsLatLon.nc
+landscape/mesh-MESH.msh
+landscape/mesh_triangles.nc
