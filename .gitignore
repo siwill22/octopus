@@ -175,3 +175,12 @@ landscape/input_30/mesh_30km.nc
 landscape/vars_30/forcing250.npz
 landscape/vars_30/mesh.npz
 landscape/vars_30/step_250.nc
+landscape/input_25_80/graph.info
+landscape/input_25_80/mesh_50km.nc
+landscape/input_25_80weights_distcoast.nc
+landscape/vars_25_80/coarse_250.nc
+landscape/vars_25_80/refine_250.nc
+landscape/vars_25_80/rain250.npz
+landscape/vars_25_80/mesh.npz
+landscape/input_25_80/staticFieldsOnCells.vtp
+landscape/input_25_80/mesh_refine.nc
