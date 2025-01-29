@@ -185,3 +185,4 @@ landscape/vars_25_80/mesh.npz
 landscape/input_25_80/staticFieldsOnCells.vtp
 landscape/input_25_80/mesh_refine.nc
 /landscape/silico_cont
+/landscape/export1
