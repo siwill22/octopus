@@ -164,3 +164,7 @@ Atlantis2_Database/PlateBoundary_Earthquakes.geojson.gplates.xml
 Atlantis2_Database/total_magnetic_intensity.nc
 /AntarcticGlaciation
 *.cache
+landscape/mesh.msh
+landscape/mesh.jig
+landscape/mesh-HFUN.msh
+landscape/cellWidthVsLatLon.nc
