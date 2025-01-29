@@ -170,3 +170,8 @@ landscape/mesh-HFUN.msh
 landscape/cellWidthVsLatLon.nc
 landscape/mesh-MESH.msh
 landscape/mesh_triangles.nc
+landscape/input_30/graph.info
+landscape/input_30/mesh_30km.nc
+landscape/vars_30/forcing250.npz
+landscape/vars_30/mesh.npz
+landscape/vars_30/step_250.nc
