@@ -27,7 +27,7 @@ reso = 0.1
 ncout = os.path.join(out_path, "data")
 
 # Initialisation of the class
-grid = mout.mapOutputs(path='./', filename='input-cont.yml', step=stp, uplift=False, flex=False)
+grid = mout.mapOutputs(path='./', filename='input-Atlantis.yml', step=stp, uplift=False, flex=False)
     
   
 
